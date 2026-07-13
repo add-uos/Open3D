@@ -10,7 +10,8 @@
 /// radius / hybrid search, ported from the CUDA implementation in
 /// FixedRadiusSearchImpl.cuh.
 ///
-/// Included only by KnnSearchOpsSYCL.cpp; not part of the public API.
+/// Included by KnnSearchOpsSYCL.cpp and PyTorch SYCL op wrappers; not part of
+/// the public API.
 ///
 /// Algorithm (mirrors CUDA; see FixedRadiusSearchImpl.cuh for the reference):
 /// - The dataset is bucketed into a uniform spatial-hash grid with cell size
@@ -105,44 +106,38 @@ inline void CollectBinsToVisit(const utility::MiniVec<T, 3>& pos,
 /// search: count points per cell -> device inclusive scan -> scatter point
 /// indices into their cell's slot range. Mirrors BuildSpatialHashTableCUDA.
 ///
-/// \p points_row_splits and \p hash_table_splits are host (CPU) tensors;
-/// \p hash_table_index and \p hash_table_cell_splits are device output
-/// tensors already sized by FixedRadiusIndex::SetTensorData.
+/// Raw-pointer variant: takes a SYCL queue directly plus host-accessible
+/// batch arrays, so both the Open3D Tensor API and the PyTorch XPU dispatch
+/// can share the same kernel implementation without tensor conversion.
+///
+/// \p host_points_row_splits and \p host_hash_table_splits are CPU arrays.
+/// \p cell_splits_ptr and \p index_ptr are device (USM or XPU) pointers.
 template <class T>
-void BuildSpatialHashTableSYCL(const Tensor& points,
-                               double radius,
-                               const Tensor& points_row_splits,
-                               const Tensor& hash_table_splits,
-                               Tensor& hash_table_index,
-                               Tensor& hash_table_cell_splits) {
-    const Device device = points.GetDevice();
-    sycl::queue queue = sy::SYCLContext::GetInstance().GetDefaultQueue(device);
+void BuildSpatialHashTableSYCLRaw(
+        sycl::queue& queue,
+        const T* points_ptr,
+        T inv_voxel_size,
+        int batch_size,
+        const int64_t* host_points_row_splits,
+        const uint32_t* host_hash_table_splits,
+        uint32_t* cell_splits_ptr,
+        size_t cell_splits_size,
+        uint32_t* index_ptr) {
     auto policy = oneapi::dpl::execution::make_device_policy(queue);
 
-    const T voxel_size = T(2 * radius);
-    const T inv_voxel_size = T(1) / voxel_size;
-
-    const T* points_ptr = points.GetDataPtr<T>();
-    uint32_t* cell_splits_ptr = hash_table_cell_splits.GetDataPtr<uint32_t>();
-    uint32_t* index_ptr = hash_table_index.GetDataPtr<uint32_t>();
-
-    queue.memset(cell_splits_ptr, 0,
-                 static_cast<size_t>(hash_table_cell_splits.NumElements()) *
-                         sizeof(uint32_t));
-    queue.wait_and_throw();
-
-    const int batch_size = static_cast<int>(points_row_splits.GetShape(0)) - 1;
+    queue.memset(cell_splits_ptr, 0, cell_splits_size * sizeof(uint32_t))
+            .wait_and_throw();
 
     // Pass 1: count points per cell (into cell_splits_i[hash + 1]), so the
     // scan in Pass 2 turns this into CSR start offsets.
     for (int b = 0; b < batch_size; ++b) {
-        const int64_t point_begin = points_row_splits[b].Item<int64_t>();
-        const int64_t point_end = points_row_splits[b + 1].Item<int64_t>();
+        const int64_t point_begin = host_points_row_splits[b];
+        const int64_t point_end = host_points_row_splits[b + 1];
         const int64_t num_points_i = point_end - point_begin;
         if (num_points_i == 0) continue;
-        const uint32_t first_cell_idx = hash_table_splits[b].Item<uint32_t>();
+        const uint32_t first_cell_idx = host_hash_table_splits[b];
         const uint32_t hash_table_size =
-                hash_table_splits[b + 1].Item<uint32_t>() - first_cell_idx;
+                host_hash_table_splits[b + 1] - first_cell_idx;
         uint32_t* cell_splits_i = cell_splits_ptr + first_cell_idx;
 
         queue.parallel_for(
@@ -150,9 +145,11 @@ void BuildSpatialHashTableSYCL(const Tensor& points,
                 [=](sycl::id<1> id) [[intel::kernel_args_restrict]] {
                     const int64_t i = point_begin + id[0];
                     utility::MiniVec<T, 3> pos(points_ptr + 3 * i);
-                    auto voxel_index = ComputeVoxelIndex(pos, inv_voxel_size);
+                    auto voxel_index =
+                            frs_detail::ComputeVoxelIndex(pos, inv_voxel_size);
                     const size_t hash =
-                            SpatialHash(voxel_index) % hash_table_size;
+                            frs_detail::SpatialHash(voxel_index) %
+                            hash_table_size;
                     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
                                      sycl::memory_scope::device>
                             cnt(cell_splits_i[hash + 1]);
@@ -164,9 +161,9 @@ void BuildSpatialHashTableSYCL(const Tensor& points,
     // Pass 2: turn per-cell counts into CSR start offsets (device inclusive
     // scan; replaces cub::DeviceScan::InclusiveSum).
     for (int b = 0; b < batch_size; ++b) {
-        const uint32_t first_cell_idx = hash_table_splits[b].Item<uint32_t>();
+        const uint32_t first_cell_idx = host_hash_table_splits[b];
         const uint32_t hash_table_size =
-                hash_table_splits[b + 1].Item<uint32_t>() - first_cell_idx;
+                host_hash_table_splits[b + 1] - first_cell_idx;
         uint32_t* cell_splits_i = cell_splits_ptr + first_cell_idx;
         std::inclusive_scan(policy, cell_splits_i,
                             cell_splits_i + hash_table_size + 1, cell_splits_i);
@@ -174,39 +171,78 @@ void BuildSpatialHashTableSYCL(const Tensor& points,
     queue.wait_and_throw();
 
     // Pass 3: scatter point indices into their cell's slot range. A fresh
-    // per-batch slot counter (reset to 0) plays the role of CUDA's
-    // count_tmp, so concurrent writers to the same cell get distinct slots.
+    // per-batch slot counter (reset to 0) plays the role of CUDA's count_tmp,
+    // so concurrent writers to the same cell get distinct slots.
+    // Uses sycl::malloc_device for the scratch buffer to avoid allocator
+    // dependencies (no Open3D Tensor or PyTorch tensor needed here).
     for (int b = 0; b < batch_size; ++b) {
-        const int64_t point_begin = points_row_splits[b].Item<int64_t>();
-        const int64_t point_end = points_row_splits[b + 1].Item<int64_t>();
+        const int64_t point_begin = host_points_row_splits[b];
+        const int64_t point_end = host_points_row_splits[b + 1];
         const int64_t num_points_i = point_end - point_begin;
         if (num_points_i == 0) continue;
-        const uint32_t first_cell_idx = hash_table_splits[b].Item<uint32_t>();
+        const uint32_t first_cell_idx = host_hash_table_splits[b];
         const uint32_t hash_table_size =
-                hash_table_splits[b + 1].Item<uint32_t>() - first_cell_idx;
+                host_hash_table_splits[b + 1] - first_cell_idx;
         const uint32_t* cell_splits_i = cell_splits_ptr + first_cell_idx;
 
-        Tensor slot_counts =
-                Tensor::Zeros({int64_t(hash_table_size)}, UInt32, device);
-        uint32_t* slot_counts_ptr = slot_counts.GetDataPtr<uint32_t>();
+        uint32_t* slot_counts =
+                sycl::malloc_device<uint32_t>(hash_table_size, queue);
+        queue.fill(slot_counts, uint32_t(0), hash_table_size).wait();
 
         queue.parallel_for(
                 sycl::range<1>(num_points_i),
                 [=](sycl::id<1> id) [[intel::kernel_args_restrict]] {
                     const int64_t i = point_begin + id[0];
                     utility::MiniVec<T, 3> pos(points_ptr + 3 * i);
-                    auto voxel_index = ComputeVoxelIndex(pos, inv_voxel_size);
+                    auto voxel_index =
+                            frs_detail::ComputeVoxelIndex(pos, inv_voxel_size);
                     const size_t hash =
-                            SpatialHash(voxel_index) % hash_table_size;
+                            frs_detail::SpatialHash(voxel_index) %
+                            hash_table_size;
                     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
                                      sycl::memory_scope::device>
-                            cnt(slot_counts_ptr[hash]);
+                            cnt(slot_counts[hash]);
                     const uint32_t slot = cnt.fetch_add(1);
                     index_ptr[cell_splits_i[hash] + slot] =
                             static_cast<uint32_t>(i);
                 });
         queue.wait_and_throw();
+        sycl::free(slot_counts, queue);
     }
+}
+
+/// Builds the uniform-grid spatial hash table. \p points_row_splits and
+/// \p hash_table_splits are host (CPU) tensors; \p hash_table_index and
+/// \p hash_table_cell_splits are device output tensors already sized by
+/// FixedRadiusIndex::SetTensorData. Delegates to BuildSpatialHashTableSYCLRaw.
+template <class T>
+void BuildSpatialHashTableSYCL(const Tensor& points,
+                               double radius,
+                               const Tensor& points_row_splits,
+                               const Tensor& hash_table_splits,
+                               Tensor& hash_table_index,
+                               Tensor& hash_table_cell_splits) {
+    const Device device = points.GetDevice();
+    sycl::queue queue = sy::SYCLContext::GetInstance().GetDefaultQueue(device);
+
+    const int batch_size = static_cast<int>(points_row_splits.GetShape(0)) - 1;
+
+    // Read host-side batch arrays (points_row_splits / hash_table_splits are
+    // CPU tensors per the FixedRadiusIndex contract).
+    std::vector<int64_t> host_pts_row_splits(batch_size + 1);
+    std::vector<uint32_t> host_ht_splits(batch_size + 1);
+    for (int i = 0; i <= batch_size; ++i) {
+        host_pts_row_splits[i] = points_row_splits[i].Item<int64_t>();
+        host_ht_splits[i] = hash_table_splits[i].Item<uint32_t>();
+    }
+
+    BuildSpatialHashTableSYCLRaw<T>(
+            queue, points.GetDataPtr<T>(),
+            T(1) / T(2 * radius), batch_size,
+            host_pts_row_splits.data(), host_ht_splits.data(),
+            hash_table_cell_splits.GetDataPtr<uint32_t>(),
+            static_cast<size_t>(hash_table_cell_splits.NumElements()),
+            hash_table_index.GetDataPtr<uint32_t>());
 }
 
 /// Counts, for every query, how many dataset points lie within \p radius,
