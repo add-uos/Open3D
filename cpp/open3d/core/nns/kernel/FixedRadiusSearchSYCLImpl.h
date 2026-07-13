@@ -113,16 +113,15 @@ inline void CollectBinsToVisit(const utility::MiniVec<T, 3>& pos,
 /// \p host_points_row_splits and \p host_hash_table_splits are CPU arrays.
 /// \p cell_splits_ptr and \p index_ptr are device (USM or XPU) pointers.
 template <class T>
-void BuildSpatialHashTableSYCLRaw(
-        sycl::queue& queue,
-        const T* points_ptr,
-        T inv_voxel_size,
-        int batch_size,
-        const int64_t* host_points_row_splits,
-        const uint32_t* host_hash_table_splits,
-        uint32_t* cell_splits_ptr,
-        size_t cell_splits_size,
-        uint32_t* index_ptr) {
+void BuildSpatialHashTableSYCLRaw(sycl::queue& queue,
+                                  const T* points_ptr,
+                                  T inv_voxel_size,
+                                  int batch_size,
+                                  const int64_t* host_points_row_splits,
+                                  const uint32_t* host_hash_table_splits,
+                                  uint32_t* cell_splits_ptr,
+                                  size_t cell_splits_size,
+                                  uint32_t* index_ptr) {
     auto policy = oneapi::dpl::execution::make_device_policy(queue);
 
     queue.memset(cell_splits_ptr, 0, cell_splits_size * sizeof(uint32_t))
@@ -145,11 +144,9 @@ void BuildSpatialHashTableSYCLRaw(
                 [=](sycl::id<1> id) [[intel::kernel_args_restrict]] {
                     const int64_t i = point_begin + id[0];
                     utility::MiniVec<T, 3> pos(points_ptr + 3 * i);
-                    auto voxel_index =
-                            frs_detail::ComputeVoxelIndex(pos, inv_voxel_size);
+                    auto voxel_index = ComputeVoxelIndex(pos, inv_voxel_size);
                     const size_t hash =
-                            frs_detail::SpatialHash(voxel_index) %
-                            hash_table_size;
+                            SpatialHash(voxel_index) % hash_table_size;
                     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
                                      sycl::memory_scope::device>
                             cnt(cell_splits_i[hash + 1]);
@@ -194,11 +191,9 @@ void BuildSpatialHashTableSYCLRaw(
                 [=](sycl::id<1> id) [[intel::kernel_args_restrict]] {
                     const int64_t i = point_begin + id[0];
                     utility::MiniVec<T, 3> pos(points_ptr + 3 * i);
-                    auto voxel_index =
-                            frs_detail::ComputeVoxelIndex(pos, inv_voxel_size);
+                    auto voxel_index = ComputeVoxelIndex(pos, inv_voxel_size);
                     const size_t hash =
-                            frs_detail::SpatialHash(voxel_index) %
-                            hash_table_size;
+                            SpatialHash(voxel_index) % hash_table_size;
                     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
                                      sycl::memory_scope::device>
                             cnt(slot_counts[hash]);
@@ -237,8 +232,7 @@ void BuildSpatialHashTableSYCL(const Tensor& points,
     }
 
     BuildSpatialHashTableSYCLRaw<T>(
-            queue, points.GetDataPtr<T>(),
-            T(1) / T(2 * radius), batch_size,
+            queue, points.GetDataPtr<T>(), T(1) / T(2 * radius), batch_size,
             host_pts_row_splits.data(), host_ht_splits.data(),
             hash_table_cell_splits.GetDataPtr<uint32_t>(),
             static_cast<size_t>(hash_table_cell_splits.NumElements()),
